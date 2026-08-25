@@ -58,6 +58,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🧭 Пошаговый разбор", callback_data="mode_step")],
         [InlineKeyboardButton(text="💰 Баланс", callback_data="show_balance")],
         [InlineKeyboardButton(text="📄 Бесплатный мануал", callback_data="show_manual")],
+        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="show_support")],
     ])
 
 
@@ -115,6 +116,12 @@ async def cb_show_manual(callback: CallbackQuery, bot: Bot):
 @router.message(Command("support"))
 async def cmd_support(message: Message):
     await message.answer(SUPPORT_TEXT.format(support_username=SUPPORT_USERNAME))
+
+
+@router.callback_query(F.data == "show_support")
+async def cb_show_support(callback: CallbackQuery):
+    await callback.message.answer(SUPPORT_TEXT.format(support_username=SUPPORT_USERNAME))
+    await callback.answer()
 
 
 # ---------------- Оплата через Telegram Stars ----------------
@@ -372,4 +379,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
- 

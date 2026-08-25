@@ -57,6 +57,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⚡ Быстрая проверка", callback_data="mode_check")],
         [InlineKeyboardButton(text="🧭 Пошаговый разбор", callback_data="mode_step")],
         [InlineKeyboardButton(text="💰 Баланс", callback_data="show_balance")],
+        [InlineKeyboardButton(text="📄 Бесплатный мануал", callback_data="show_manual")],
     ])
 
 
@@ -93,12 +94,22 @@ async def cb_show_balance(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.message(Command("manual"))
-async def cmd_manual(message: Message):
+async def _send_manual(chat_id: int, bot: Bot):
     if os.path.exists(MANUAL_FILE_PATH):
-        await message.answer_document(FSInputFile(MANUAL_FILE_PATH), caption=MANUAL_CAPTION)
+        await bot.send_document(chat_id, FSInputFile(MANUAL_FILE_PATH), caption=MANUAL_CAPTION)
     else:
-        await message.answer("Мануал временно недоступен, напиши в /support.")
+        await bot.send_message(chat_id, "Мануал временно недоступен, напиши в /support.")
+
+
+@router.message(Command("manual"))
+async def cmd_manual(message: Message, bot: Bot):
+    await _send_manual(message.chat.id, bot)
+
+
+@router.callback_query(F.data == "show_manual")
+async def cb_show_manual(callback: CallbackQuery, bot: Bot):
+    await _send_manual(callback.message.chat.id, bot)
+    await callback.answer()
 
 
 @router.message(Command("support"))
@@ -361,3 +372,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

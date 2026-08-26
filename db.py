@@ -18,7 +18,9 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-DB_PATH = "goalbot.db"
+import os
+
+DB_PATH = os.getenv("DB_PATH", "goalbot.db")
 
 
 def init_db():

@@ -6,6 +6,7 @@ Telegram-бот "Самоосуществлятор целей" — платна
 Запуск: python bot.py
 """
 import asyncio
+import hashlib
 import logging
 import os
 
@@ -18,7 +19,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, PreCheckoutQuery, FSInputFile,
+    LabeledPrice, PreCheckoutQuery, FSInputFile, BotCommand,
 )
 
 import db
@@ -28,7 +29,8 @@ from config import (
 )
 from prompts import (
     WELCOME_TEXT, STEP_START_TEXT, BALANCE_TEXT_TEMPLATE, NO_CREDITS_TEXT,
-    MANUAL_CAPTION, SUPPORT_TEXT, HELP_TEXT,
+    MANUAL_CAPTION, SUPPORT_TEXT, HELP_TEXT, BALANCE_CHANGED_NOTICE,
+    CREDIT_CONTINUED_NOTICE,
 )
 from claude_client import check_goal_once, step_dialogue, goal_reached
 
@@ -37,8 +39,9 @@ log = logging.getLogger(__name__)
 
 router = Router()
 
-# История пошагового диалога — в памяти процесса (см. ограничения в README).
 step_histories: dict[int, list[dict]] = {}
+
+TELEGRAM_MESSAGE_LIMIT = 4000
 
 
 class GoalStates(StatesGroup):
@@ -66,7 +69,33 @@ def is_owner(telegram_id: int) -> bool:
     return telegram_id == OWNER_TELEGRAM_ID
 
 
-# ---------------- Базовые команды ----------------
+def hash_text(text: str) -> str:
+    normalized = text.strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+async def send_long_message(bot: Bot, chat_id: int, text: str, reply_markup=None):
+    if len(text) <= TELEGRAM_MESSAGE_LIMIT:
+        await bot.send_message(chat_id, text, reply_markup=reply_markup)
+        return
+
+    chunks = []
+    remaining = text
+    while len(remaining) > TELEGRAM_MESSAGE_LIMIT:
+        split_at = remaining.rfind("\n\n", 0, TELEGRAM_MESSAGE_LIMIT)
+        if split_at == -1:
+            split_at = remaining.rfind("\n", 0, TELEGRAM_MESSAGE_LIMIT)
+        if split_at == -1:
+            split_at = TELEGRAM_MESSAGE_LIMIT
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        chunks.append(remaining)
+
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await bot.send_message(chat_id, chunk, reply_markup=reply_markup if is_last else None)
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -124,8 +153,6 @@ async def cb_show_support(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------------- Оплата через Telegram Stars ----------------
-
 @router.callback_query(F.data == "buy_1")
 async def cb_buy_1(callback: CallbackQuery, bot: Bot):
     await bot.send_invoice(
@@ -133,7 +160,7 @@ async def cb_buy_1(callback: CallbackQuery, bot: Bot):
         title="1 кредит — Самоосуществлятор целей",
         description="1 кредит = 5 попыток разобрать одну цель.",
         payload=f"credit_1_{callback.from_user.id}",
-        provider_token="",  # пусто для Telegram Stars
+        provider_token="",
         currency="XTR",
         prices=[LabeledPrice(label="1 кредит", amount=CREDIT_PRICE_STARS)],
     )
@@ -159,8 +186,6 @@ async def process_successful_payment(message: Message):
     user = db.get_user(message.from_user.id)
     await message.answer(f"Зачислено. Баланс: {user['credits_balance']} кредитов.")
 
-
-# ---------------- Режимы проверки ----------------
 
 @router.callback_query(F.data == "mode_check")
 async def cb_mode_check(callback: CallbackQuery, state: FSMContext):
@@ -198,10 +223,10 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 
 async def _reject_no_credits(message: Message):
-    await message.answer(NO_CREDITS_TEXT, reply_markup=buy_credits_kb())
+    await message.answer(NO_CREDITS_TEXT.format(price=CREDIT_PRICE_STARS), reply_markup=buy_credits_kb())
 
 
-@router.message(GoalStates.waiting_check)
+@router.message(GoalStates.waiting_check, ~F.text.startswith("/"))
 async def handle_check(message: Message, bot: Bot, state: FSMContext):
     telegram_id = message.from_user.id
     db.get_or_create_user(telegram_id, message.from_user.username)
@@ -212,28 +237,36 @@ async def handle_check(message: Message, bot: Bot, state: FSMContext):
         return
 
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    try:
-        result = await check_goal_once(message.text)
-    except Exception as e:
-        log.exception("Claude API error in check mode")
-        await message.answer("Что-то сломалось на стороне нейросети. Попробуй ещё раз — попытка не списана.")
-        return
+
+    text_hash = hash_text(message.text)
+    cached = db.get_cached_response(text_hash)
+    if cached is not None:
+        result = cached
+    else:
+        try:
+            result = await check_goal_once(message.text)
+        except Exception:
+            log.exception("Claude API error in check mode")
+            await message.answer("Что-то сломалось на стороне нейросети. Попробуй ещё раз — попытка не списана.")
+            return
+        db.cache_response(text_hash, result)
 
     reached = goal_reached(result)
-    db.commit_attempt(telegram_id, goal_reached=reached)
+    outcome = db.commit_attempt(telegram_id, goal_reached=reached)
     db.log_request(telegram_id, "check", message.text, result, charged=True)
 
-    await message.answer(result)
-    if reached:
+    await send_long_message(bot, message.chat.id, result)
+
+    if outcome["reason"] == "success":
         await state.clear()
-    else:
-        user = db.get_user(telegram_id)
-        if user["cycle_active"] == 0:
-            await message.answer("Попытки на эту цель закончились. /balance для пополнения.")
-            await state.clear()
+    elif outcome["reason"] == "continued":
+        await message.answer(CREDIT_CONTINUED_NOTICE.format(credits=outcome["credits_balance"]))
+    elif outcome["reason"] == "exhausted_no_credits":
+        await message.answer("Попытки на эту цель закончились. /balance для пополнения.")
+        await state.clear()
 
 
-@router.message(GoalStates.in_step_dialogue)
+@router.message(GoalStates.in_step_dialogue, ~F.text.startswith("/"))
 async def handle_step(message: Message, bot: Bot, state: FSMContext):
     telegram_id = message.from_user.id
     db.get_or_create_user(telegram_id, message.from_user.username)
@@ -250,7 +283,7 @@ async def handle_step(message: Message, bot: Bot, state: FSMContext):
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     try:
         reply = await step_dialogue(history)
-    except Exception as e:
+    except Exception:
         log.exception("Claude API error in step mode")
         history.pop()
         await message.answer("Что-то сломалось на стороне нейросети. Попробуй ещё раз — попытка не списана.")
@@ -259,22 +292,21 @@ async def handle_step(message: Message, bot: Bot, state: FSMContext):
     history.append({"role": "assistant", "content": reply})
 
     reached = goal_reached(reply)
-    db.commit_attempt(telegram_id, goal_reached=reached)
+    outcome = db.commit_attempt(telegram_id, goal_reached=reached)
     db.log_request(telegram_id, "step", message.text, reply, charged=True)
 
-    await message.answer(reply)
-    if reached:
+    await send_long_message(bot, message.chat.id, reply)
+
+    if outcome["reason"] == "success":
         await state.clear()
         step_histories.pop(telegram_id, None)
-    else:
-        user = db.get_user(telegram_id)
-        if user["cycle_active"] == 0:
-            await message.answer("Попытки на эту цель закончились. /balance для пополнения.")
-            await state.clear()
-            step_histories.pop(telegram_id, None)
+    elif outcome["reason"] == "continued":
+        await message.answer(CREDIT_CONTINUED_NOTICE.format(credits=outcome["credits_balance"]))
+    elif outcome["reason"] == "exhausted_no_credits":
+        await message.answer("Попытки на эту цель закончились. /balance для пополнения.")
+        await state.clear()
+        step_histories.pop(telegram_id, None)
 
-
-# ---------------- Админка (только владелец) ----------------
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
@@ -291,7 +323,8 @@ async def cmd_admin(message: Message):
         f"/recent — последние запросы\n"
         f"/topusers — список пользователей и балансов\n"
         f"/userhistory <telegram_id> — история конкретного юзера\n"
-        f"/setbalance <telegram_id> <число> — выставить баланс вручную"
+        f"/setbalance <telegram_id> <число> — выставить баланс вручную\n"
+        f"/broadcast <текст> — разослать сообщение всем пользователям"
     )
     await message.answer(text)
 
@@ -342,7 +375,7 @@ async def cmd_userhistory(message: Message):
 
 
 @router.message(Command("setbalance"))
-async def cmd_setbalance(message: Message):
+async def cmd_setbalance(message: Message, bot: Bot):
     if not is_owner(message.from_user.id):
         return
     parts = message.text.split()
@@ -355,8 +388,36 @@ async def cmd_setbalance(message: Message):
     db.set_credits(telegram_id, amount)
     await message.answer(f"Баланс {telegram_id} установлен: {amount} кредитов.")
 
+    try:
+        await bot.send_message(telegram_id, BALANCE_CHANGED_NOTICE.format(credits=amount))
+    except Exception:
+        log.warning(f"Не удалось уведомить пользователя {telegram_id} об изменении баланса")
 
-# ---------------- Фоллбек ----------------
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+    text = message.text.partition(" ")[2].strip()
+    if not text:
+        await message.answer("Использование: /broadcast <текст сообщения>")
+        return
+
+    user_ids = db.get_all_user_ids()
+    await message.answer(f"Начинаю рассылку на {len(user_ids)} пользователей...")
+
+    sent = 0
+    failed = 0
+    for telegram_id in user_ids:
+        try:
+            await bot.send_message(telegram_id, text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await message.answer(f"Рассылка завершена. Доставлено: {sent}. Не доставлено: {failed}.")
+
 
 @router.message()
 async def fallback(message: Message):
@@ -365,12 +426,24 @@ async def fallback(message: Message):
     )
 
 
+async def _set_commands(bot: Bot):
+    await bot.set_my_commands([
+        BotCommand(command="check", description="Быстрая проверка цели"),
+        BotCommand(command="step", description="Пошаговый разбор"),
+        BotCommand(command="balance", description="Баланс и пополнение"),
+        BotCommand(command="manual", description="Бесплатный мануал"),
+        BotCommand(command="support", description="Поддержка"),
+        BotCommand(command="help", description="Список команд"),
+    ])
+
+
 async def main():
     db.init_db()
     bot = Bot(
         token=TELEGRAM_BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    await _set_commands(bot)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     log.info("Бот запущен")
@@ -379,3 +452,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

@@ -20,6 +20,7 @@ async def check_goal_once(goal_text: str) -> str:
     response = await client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=MAX_TOKENS,
+        temperature=0,
         system=SYSTEM_PROMPT,
         messages=[
             {
@@ -43,6 +44,7 @@ async def step_dialogue(history: list[dict]) -> str:
     response = await client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=MAX_TOKENS,
+        temperature=0,
         system=SYSTEM_PROMPT,
         messages=history,
     )

@@ -56,6 +56,13 @@ def init_db():
                 created_at INTEGER NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS response_cache (
+                text_hash TEXT PRIMARY KEY,
+                response TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
 
 
 @contextmanager
@@ -102,34 +109,59 @@ def has_available_attempt(telegram_id: int) -> bool:
     return False
 
 
-def commit_attempt(telegram_id: int, goal_reached: bool) -> None:
+def commit_attempt(telegram_id: int, goal_reached: bool) -> dict:
     """Вызывается ПОСЛЕ успешного ответа API — фиксирует списание попытки/кредита.
-    goal_reached=True закрывает цикл сразу (остаток попыток сгорает)."""
+
+    Возвращает словарь:
+    - reason: 'success' | 'continued' | 'exhausted_no_credits' | 'ongoing'
+    - credits_balance: текущий остаток кредитов после операции
+    - attempts_used: попыток использовано в текущем (возможно новом) цикле
+
+    'success' — цель прошла рамку, цикл закрыт, остаток попыток сгорает.
+    'continued' — 5 попыток исчерпаны без успеха, но есть ещё кредиты: следующий
+      кредит подключён автоматически, диалог продолжается бесшовно.
+    'exhausted_no_credits' — 5 попыток исчерпаны без успеха и кредитов больше нет.
+    'ongoing' — попытка использована, цикл продолжается (меньше 5 попыток, не успех).
+    """
     with _conn() as c:
         row = c.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
         if row is None:
-            return
+            return {"reason": "ongoing", "credits_balance": 0, "attempts_used": 0}
 
         cycle_active = row["cycle_active"]
         attempts_used = row["attempts_used"]
         credits_balance = row["credits_balance"]
 
         if not cycle_active:
-            # Открываем новый цикл — списываем кредит
             credits_balance -= 1
             cycle_active = 1
             attempts_used = 1
         else:
             attempts_used += 1
 
-        if goal_reached or attempts_used >= 5:
+        if goal_reached:
             cycle_active = 0
             attempts_used = 0
+            reason = "success"
+        elif attempts_used >= 5:
+            if credits_balance > 0:
+                credits_balance -= 1
+                attempts_used = 0
+                cycle_active = 1
+                reason = "continued"
+            else:
+                cycle_active = 0
+                attempts_used = 0
+                reason = "exhausted_no_credits"
+        else:
+            reason = "ongoing"
 
         c.execute(
             "UPDATE users SET credits_balance = ?, cycle_active = ?, attempts_used = ? WHERE telegram_id = ?",
             (credits_balance, cycle_active, attempts_used, telegram_id),
         )
+
+        return {"reason": reason, "credits_balance": credits_balance, "attempts_used": attempts_used}
 
 
 def log_request(telegram_id: int, mode: str, user_message: str, bot_response: str, charged: bool) -> None:
@@ -164,6 +196,32 @@ def log_payment(telegram_id: int, credits_added: int, stars_amount: int, charge_
             "VALUES (?, ?, ?, ?, ?)",
             (telegram_id, credits_added, stars_amount, charge_id, int(time.time())),
         )
+
+
+# ---- Кэш ответов (для консистентности при повторе одной формулировки, /check) ----
+
+def get_cached_response(text_hash: str) -> str | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT response FROM response_cache WHERE text_hash = ?", (text_hash,)
+        ).fetchone()
+        return row["response"] if row else None
+
+
+def cache_response(text_hash: str, response: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO response_cache (text_hash, response, created_at) VALUES (?, ?, ?)",
+            (text_hash, response, int(time.time())),
+        )
+
+
+# ---- Рассылка ----
+
+def get_all_user_ids() -> list[int]:
+    with _conn() as c:
+        rows = c.execute("SELECT telegram_id FROM users").fetchall()
+        return [r["telegram_id"] for r in rows]
 
 
 # ---- Админ-статистика ----

@@ -8,7 +8,7 @@ from prompts import SYSTEM_PROMPT
 
 client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-MAX_TOKENS = 1500
+MAX_TOKENS = 3000
 
 # Строка-маркер финальной памятки — используется, чтобы код мог определить
 # успешное прохождение рамки и закрыть цикл попыток.

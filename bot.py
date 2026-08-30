@@ -310,7 +310,9 @@ async def handle_step(message: Message, bot: Bot, state: FSMContext):
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
+    log.info(f"DEBUG /admin received from {message.from_user.id}, OWNER_TELEGRAM_ID={OWNER_TELEGRAM_ID}")
     if not is_owner(message.from_user.id):
+        log.info("DEBUG /admin rejected: not owner")
         return
     try:
         stats = db.admin_stats()

@@ -380,6 +380,28 @@ async def cmd_userhistory(message: Message):
     await message.answer("\n".join(lines))
 
 
+@router.message(Command("viewrequest"))
+async def cmd_viewrequest(message: Message, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /viewrequest <id>")
+        return
+    request_id = int(parts[1])
+    row = db.get_request_by_id(request_id)
+    if not row:
+        await message.answer(f"Запрос с id {request_id} не найден.")
+        return
+    text = (
+        f"[{row['id']}] telegram_id: {row['telegram_id']}\n"
+        f"Режим: {row['mode']}\n\n"
+        f"— Сообщение пользователя —\n{row['user_message']}\n\n"
+        f"— Ответ бота —\n{row['bot_response']}"
+    )
+    await send_long_message(bot, message.chat.id, text)
+
+
 @router.message(Command("setbalance"))
 async def cmd_setbalance(message: Message, bot: Bot):
     if not is_owner(message.from_user.id):
@@ -458,4 +480,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

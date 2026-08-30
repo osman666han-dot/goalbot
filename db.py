@@ -169,7 +169,7 @@ def log_request(telegram_id: int, mode: str, user_message: str, bot_response: st
         c.execute(
             "INSERT INTO requests (telegram_id, mode, user_message, bot_response, charged, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (telegram_id, mode, user_message[:2000], bot_response[:2000], int(charged), int(time.time())),
+            (telegram_id, mode, user_message, bot_response, int(charged), int(time.time())),
         )
 
 
@@ -263,3 +263,10 @@ def user_history(telegram_id: int, limit: int = 20) -> list[sqlite3.Row]:
             "SELECT * FROM requests WHERE telegram_id = ? ORDER BY id DESC LIMIT ?",
             (telegram_id, limit),
         ).fetchall()
+
+
+def get_request_by_id(request_id: int) -> sqlite3.Row | None:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM requests WHERE id = ?", (request_id,)
+        ).fetchone()

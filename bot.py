@@ -312,20 +312,24 @@ async def handle_step(message: Message, bot: Bot, state: FSMContext):
 async def cmd_admin(message: Message):
     if not is_owner(message.from_user.id):
         return
-    stats = db.admin_stats()
-    text = (
-        f"Пользователей: {stats['total_users']}\n"
-        f"Куплено кредитов всего: {stats['total_credits_bought']}\n"
-        f"Заработано Stars всего: {stats['total_stars_earned']}\n"
-        f"Запросов к API всего: {stats['total_requests']}\n"
-        f"Сумма непотраченных кредитов у юзеров: {stats['active_credits_balance']}\n\n"
-        f"Команды:\n"
-        f"/recent — последние запросы\n"
-        f"/topusers — список пользователей и балансов\n"
-        f"/userhistory <telegram_id> — история конкретного юзера\n"
-        f"/setbalance <telegram_id> <число> — выставить баланс вручную\n"
-        f"/broadcast <текст> — разослать сообщение всем пользователям"
-    )
+    try:
+        stats = db.admin_stats()
+        text = (
+            f"Пользователей: {stats['total_users']}\n"
+            f"Куплено кредитов всего: {stats['total_credits_bought']}\n"
+            f"Заработано Stars всего: {stats['total_stars_earned']}\n"
+            f"Запросов к API всего: {stats['total_requests']}\n"
+            f"Сумма непотраченных кредитов у юзеров: {stats['active_credits_balance']}\n\n"
+            f"Команды:\n"
+            f"/recent — последние запросы\n"
+            f"/topusers — список пользователей и балансов\n"
+            f"/userhistory <telegram_id> — история конкретного юзера\n"
+            f"/setbalance <telegram_id> <число> — выставить баланс вручную\n"
+            f"/broadcast <текст> — разослать сообщение всем пользователям"
+        )
+    except Exception as e:
+        log.exception("Error in /admin")
+        text = f"Ошибка в /admin: {type(e).__name__}: {e}"
     await message.answer(text)
 
 

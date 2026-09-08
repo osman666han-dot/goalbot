@@ -395,7 +395,6 @@ async def handle_step(message: Message, bot: Bot, state: FSMContext):
         step_histories.pop(telegram_id, None)
 
 
-@router.message(Command("admin"))
 def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Последние запросы", callback_data="admin_recent")],

@@ -13,6 +13,7 @@ import os
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatAction
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,12 +26,12 @@ from aiogram.types import (
 import db
 from config import (
     TELEGRAM_BOT_TOKEN, OWNER_TELEGRAM_ID, SUPPORT_USERNAME,
-    MANUAL_FILE_PATH, CREDIT_PRICE_STARS,
+    MANUAL_FILE_PATH, CREDIT_PRICE_STARS, CHANNEL_USERNAME,
 )
 from prompts import (
     WELCOME_TEXT, STEP_START_TEXT, BALANCE_TEXT_TEMPLATE, NO_CREDITS_TEXT,
     MANUAL_CAPTION, SUPPORT_TEXT, HELP_TEXT, BALANCE_CHANGED_NOTICE,
-    CREDIT_CONTINUED_NOTICE,
+    CREDIT_CONTINUED_NOTICE, SUBSCRIBE_REQUIRED_TEXT, SUBSCRIBE_STILL_MISSING_TEXT,
 )
 from claude_client import check_goal_once, step_dialogue, goal_reached
 
@@ -69,6 +70,43 @@ def is_owner(telegram_id: int) -> bool:
     return telegram_id == OWNER_TELEGRAM_ID
 
 
+def subscribe_gate_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")],
+        [InlineKeyboardButton(text="✅ Я подписался, проверить", callback_data="recheck_sub")],
+    ])
+
+
+async def is_subscribed(bot: Bot, telegram_id: int) -> bool:
+    """Проверяет подписку на канал через Telegram Bot API. Бот должен быть
+    администратором канала — иначе проверка всегда будет падать с ошибкой.
+    Fail-safe: если сама проверка технически не удалась (сбой API, таймаут) —
+    пропускаем пользователя, а не блокируем из-за временной неполадки."""
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=telegram_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        log.warning(f"Не удалось проверить подписку для {telegram_id}, пропускаем (fail-safe)")
+        return True
+
+
+async def require_subscription(event, bot: Bot) -> bool:
+    """Гейт-функция, вызывается в начале КАЖДОГО пользовательского действия
+    (кроме админ-команд). Возвращает True, если можно продолжать; если False —
+    сама уже отправила пользователю сообщение с просьбой подписаться."""
+    telegram_id = event.from_user.id
+    if is_owner(telegram_id):
+        return True  # владелец не гейтится, чтобы не потерять доступ к своему же боту
+    if await is_subscribed(bot, telegram_id):
+        return True
+    if isinstance(event, CallbackQuery):
+        await event.message.answer(SUBSCRIBE_REQUIRED_TEXT, reply_markup=subscribe_gate_kb())
+        await event.answer()
+    else:
+        await event.answer(SUBSCRIBE_REQUIRED_TEXT, reply_markup=subscribe_gate_kb())
+    return False
+
+
 def hash_text(text: str) -> str:
     normalized = text.strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -98,29 +136,51 @@ async def send_long_message(bot: Bot, chat_id: int, text: str, reply_markup=None
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     db.get_or_create_user(message.from_user.id, message.from_user.username)
+    if not await require_subscription(message, bot):
+        return
     await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
 
 
+@router.callback_query(F.data == "recheck_sub")
+async def cb_recheck_sub(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    if await is_subscribed(bot, callback.from_user.id):
+        await state.clear()
+        db.get_or_create_user(callback.from_user.id, callback.from_user.username)
+        await callback.message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+    else:
+        await callback.message.answer(SUBSCRIBE_STILL_MISSING_TEXT, reply_markup=subscribe_gate_kb())
+    await callback.answer()
+
+
 @router.message(Command("help"))
-async def cmd_help(message: Message):
+async def cmd_help(message: Message, bot: Bot):
+    if not await require_subscription(message, bot):
+        return
     await message.answer(HELP_TEXT)
 
 
+def _balance_text(telegram_id: int, user) -> str:
+    free_status = "доступен" if db.has_free_credit_today(telegram_id) else "использован сегодня"
+    return BALANCE_TEXT_TEMPLATE.format(free_status=free_status, credits=user["credits_balance"])
+
+
 @router.message(Command("balance"))
-async def cmd_balance(message: Message):
+async def cmd_balance(message: Message, bot: Bot):
+    if not await require_subscription(message, bot):
+        return
     user = db.get_or_create_user(message.from_user.id, message.from_user.username)
-    text = BALANCE_TEXT_TEMPLATE.format(credits=user["credits_balance"])
-    await message.answer(text, reply_markup=buy_credits_kb())
+    await message.answer(_balance_text(message.from_user.id, user), reply_markup=buy_credits_kb())
 
 
 @router.callback_query(F.data == "show_balance")
-async def cb_show_balance(callback: CallbackQuery):
+async def cb_show_balance(callback: CallbackQuery, bot: Bot):
+    if not await require_subscription(callback, bot):
+        return
     user = db.get_or_create_user(callback.from_user.id, callback.from_user.username)
-    text = BALANCE_TEXT_TEMPLATE.format(credits=user["credits_balance"])
-    await callback.message.answer(text, reply_markup=buy_credits_kb())
+    await callback.message.answer(_balance_text(callback.from_user.id, user), reply_markup=buy_credits_kb())
     await callback.answer()
 
 
@@ -133,28 +193,38 @@ async def _send_manual(chat_id: int, bot: Bot):
 
 @router.message(Command("manual"))
 async def cmd_manual(message: Message, bot: Bot):
+    if not await require_subscription(message, bot):
+        return
     await _send_manual(message.chat.id, bot)
 
 
 @router.callback_query(F.data == "show_manual")
 async def cb_show_manual(callback: CallbackQuery, bot: Bot):
+    if not await require_subscription(callback, bot):
+        return
     await _send_manual(callback.message.chat.id, bot)
     await callback.answer()
 
 
 @router.message(Command("support"))
-async def cmd_support(message: Message):
+async def cmd_support(message: Message, bot: Bot):
+    if not await require_subscription(message, bot):
+        return
     await message.answer(SUPPORT_TEXT.format(support_username=SUPPORT_USERNAME))
 
 
 @router.callback_query(F.data == "show_support")
-async def cb_show_support(callback: CallbackQuery):
+async def cb_show_support(callback: CallbackQuery, bot: Bot):
+    if not await require_subscription(callback, bot):
+        return
     await callback.message.answer(SUPPORT_TEXT.format(support_username=SUPPORT_USERNAME))
     await callback.answer()
 
 
 @router.callback_query(F.data == "buy_1")
 async def cb_buy_1(callback: CallbackQuery, bot: Bot):
+    if not await require_subscription(callback, bot):
+        return
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title="1 кредит — Самоосуществлятор целей",
@@ -188,14 +258,18 @@ async def process_successful_payment(message: Message):
 
 
 @router.callback_query(F.data == "mode_check")
-async def cb_mode_check(callback: CallbackQuery, state: FSMContext):
+async def cb_mode_check(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await require_subscription(callback, bot):
+        return
     await state.set_state(GoalStates.waiting_check)
     await callback.message.answer("Пришли формулировку цели целиком одним сообщением.")
     await callback.answer()
 
 
 @router.callback_query(F.data == "mode_step")
-async def cb_mode_step(callback: CallbackQuery, state: FSMContext):
+async def cb_mode_step(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await require_subscription(callback, bot):
+        return
     step_histories[callback.from_user.id] = []
     await state.set_state(GoalStates.in_step_dialogue)
     await callback.message.answer(STEP_START_TEXT)
@@ -203,13 +277,17 @@ async def cb_mode_step(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(Command("check"))
-async def cmd_check(message: Message, state: FSMContext):
+async def cmd_check(message: Message, state: FSMContext, bot: Bot):
+    if not await require_subscription(message, bot):
+        return
     await state.set_state(GoalStates.waiting_check)
     await message.answer("Пришли формулировку цели целиком одним сообщением.")
 
 
 @router.message(Command("step"))
-async def cmd_step(message: Message, state: FSMContext):
+async def cmd_step(message: Message, state: FSMContext, bot: Bot):
+    if not await require_subscription(message, bot):
+        return
     step_histories[message.from_user.id] = []
     await state.set_state(GoalStates.in_step_dialogue)
     await message.answer(STEP_START_TEXT)
@@ -230,6 +308,10 @@ async def _reject_no_credits(message: Message):
 async def handle_check(message: Message, bot: Bot, state: FSMContext):
     telegram_id = message.from_user.id
     db.get_or_create_user(telegram_id, message.from_user.username)
+
+    if not await require_subscription(message, bot):
+        await state.clear()
+        return
 
     if not db.has_available_attempt(telegram_id):
         await _reject_no_credits(message)
@@ -271,6 +353,11 @@ async def handle_step(message: Message, bot: Bot, state: FSMContext):
     telegram_id = message.from_user.id
     db.get_or_create_user(telegram_id, message.from_user.username)
 
+    if not await require_subscription(message, bot):
+        await state.clear()
+        step_histories.pop(telegram_id, None)
+        return
+
     if not db.has_available_attempt(telegram_id):
         await _reject_no_credits(message)
         await state.clear()
@@ -309,56 +396,88 @@ async def handle_step(message: Message, bot: Bot, state: FSMContext):
 
 
 @router.message(Command("admin"))
+def admin_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Последние запросы", callback_data="admin_recent")],
+        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin_topusers")],
+    ])
+
+
+def _admin_stats_text() -> str:
+    stats = db.admin_stats()
+    return (
+        f"Пользователей: {stats['total_users']}\n"
+        f"Заблокировали бота: {stats['blocked_count']}\n"
+        f"Куплено кредитов всего: {stats['total_credits_bought']}\n"
+        f"Заработано Stars всего: {stats['total_stars_earned']}\n"
+        f"Запросов к API всего: {stats['total_requests']}\n"
+        f"Сумма непотраченных кредитов у юзеров: {stats['active_credits_balance']}\n\n"
+        f"Команды:\n"
+        f"/recent — последние запросы\n"
+        f"/topusers — список пользователей и балансов\n"
+        f"/userhistory <telegram_id> — история конкретного юзера\n"
+        f"/viewrequest <id> — полный текст одного запроса\n"
+        f"/setbalance <telegram_id> <число> — выставить баланс вручную\n"
+        f"/broadcast <текст> — разослать сообщение всем пользователям"
+    )
+
+
+def _recent_text() -> str:
+    rows = db.recent_requests(15)
+    if not rows:
+        return "Пока пусто."
+    lines = [f"[{r['id']}] {r['telegram_id']} ({r['mode']}): {r['user_message'][:80]}" for r in rows]
+    return "\n".join(lines)
+
+
+def _topusers_text() -> str:
+    rows = db.top_users(20)
+    if not rows:
+        return "Пока пусто."
+    lines = [f"{r['telegram_id']} (@{r['username']}): {r['credits_balance']} кредитов" for r in rows]
+    return "\n".join(lines)
+
+
+@router.message(Command("admin"))
 async def cmd_admin(message: Message):
-    log.info(f"DEBUG /admin received from {message.from_user.id}, OWNER_TELEGRAM_ID={OWNER_TELEGRAM_ID}")
     if not is_owner(message.from_user.id):
-        log.info("DEBUG /admin rejected: not owner")
         return
     try:
-        stats = db.admin_stats()
-        text = (
-            f"Пользователей: {stats['total_users']}\n"
-            f"Куплено кредитов всего: {stats['total_credits_bought']}\n"
-            f"Заработано Stars всего: {stats['total_stars_earned']}\n"
-            f"Запросов к API всего: {stats['total_requests']}\n"
-            f"Сумма непотраченных кредитов у юзеров: {stats['active_credits_balance']}\n\n"
-            f"Команды:\n"
-            f"/recent — последние запросы\n"
-            f"/topusers — список пользователей и балансов\n"
-            f"/userhistory <telegram_id> — история конкретного юзера\n"
-            f"/setbalance <telegram_id> <число> — выставить баланс вручную\n"
-            f"/broadcast <текст> — разослать сообщение всем пользователям"
-        )
+        text = _admin_stats_text()
     except Exception as e:
         log.exception("Error in /admin")
         text = f"Ошибка в /admin: {type(e).__name__}: {e}"
-    await message.answer(text)
+    await message.answer(text, reply_markup=admin_panel_kb())
+
+
+@router.callback_query(F.data == "admin_recent")
+async def cb_admin_recent(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    await callback.message.answer(_recent_text())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_topusers")
+async def cb_admin_topusers(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    await callback.message.answer(_topusers_text())
+    await callback.answer()
 
 
 @router.message(Command("recent"))
 async def cmd_recent(message: Message):
     if not is_owner(message.from_user.id):
         return
-    rows = db.recent_requests(15)
-    if not rows:
-        await message.answer("Пока пусто.")
-        return
-    lines = []
-    for r in rows:
-        lines.append(f"[{r['id']}] {r['telegram_id']} ({r['mode']}): {r['user_message'][:80]}")
-    await message.answer("\n".join(lines))
+    await message.answer(_recent_text())
 
 
 @router.message(Command("topusers"))
 async def cmd_topusers(message: Message):
     if not is_owner(message.from_user.id):
         return
-    rows = db.top_users(20)
-    if not rows:
-        await message.answer("Пока пусто.")
-        return
-    lines = [f"{r['telegram_id']} (@{r['username']}): {r['credits_balance']} кредитов" for r in rows]
-    await message.answer("\n".join(lines))
+    await message.answer(_topusers_text())
 
 
 @router.message(Command("userhistory"))
@@ -418,6 +537,10 @@ async def cmd_setbalance(message: Message, bot: Bot):
 
     try:
         await bot.send_message(telegram_id, BALANCE_CHANGED_NOTICE.format(credits=amount))
+        db.mark_unblocked(telegram_id)
+    except TelegramForbiddenError:
+        db.mark_blocked(telegram_id)
+        log.info(f"Пользователь {telegram_id} заблокировал бота")
     except Exception:
         log.warning(f"Не удалось уведомить пользователя {telegram_id} об изменении баланса")
 
@@ -439,7 +562,11 @@ async def cmd_broadcast(message: Message, bot: Bot):
     for telegram_id in user_ids:
         try:
             await bot.send_message(telegram_id, text)
+            db.mark_unblocked(telegram_id)
             sent += 1
+        except TelegramForbiddenError:
+            db.mark_blocked(telegram_id)
+            failed += 1
         except Exception:
             failed += 1
         await asyncio.sleep(0.05)

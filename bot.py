@@ -6,9 +6,12 @@ Telegram-бот "Самоосуществлятор целей" — платна
 Запуск: python bot.py
 """
 import asyncio
+import csv
 import hashlib
 import logging
 import os
+import tempfile
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
@@ -383,8 +386,9 @@ async def handle_step(message: Message, bot: Bot, state: FSMContext):
 
 def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Выгрузить в файл (CSV)", callback_data="admin_export")],
         [InlineKeyboardButton(text="📋 Последние запросы", callback_data="admin_recent")],
-        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin_topusers")],
+        [InlineKeyboardButton(text="👥 Топ пользователей", callback_data="admin_topusers")],
     ])
 
 
@@ -398,6 +402,7 @@ def _admin_stats_text() -> str:
         f"Запросов к API всего: {stats['total_requests']}\n"
         f"Сумма непотраченных кредитов у юзеров: {stats['active_credits_balance']}\n\n"
         f"Команды:\n"
+        f"/export — CSV со всеми пользователями\n"
         f"/recent — последние запросы\n"
         f"/topusers — список пользователей и балансов\n"
         f"/userhistory <telegram_id> — история конкретного юзера\n"
@@ -423,16 +428,69 @@ def _topusers_text() -> str:
     return "\n".join(lines)
 
 
+def _build_users_csv() -> str:
+    """Собирает CSV со всеми пользователями во временный файл, возвращает путь."""
+    rows = db.all_users_full()
+    fd, path = tempfile.mkstemp(suffix=".csv", prefix="goalbot_users_")
+    with os.fdopen(fd, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "telegram_id", "username", "credits_balance", "cycle_active",
+            "attempts_used", "last_free_credit_date", "is_blocked", "created_at",
+        ])
+        for r in rows:
+            created = datetime.fromtimestamp(r["created_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            writer.writerow([
+                r["telegram_id"], r["username"] or "", r["credits_balance"], r["cycle_active"],
+                r["attempts_used"], r["last_free_credit_date"] or "", r["is_blocked"], created,
+            ])
+    return path
+
+
+async def _send_users_export(chat_id: int, bot: Bot):
+    path = _build_users_csv()
+    try:
+        await bot.send_document(chat_id, FSInputFile(path, filename="goalbot_users.csv"), caption=_admin_stats_text())
+    finally:
+        os.remove(path)
+
+
 @router.message(Command("admin"))
-async def cmd_admin(message: Message):
+async def cmd_admin(message: Message, bot: Bot):
     if not is_owner(message.from_user.id):
         return
     try:
         text = _admin_stats_text()
-    except Exception as e:
+        await message.answer(text, reply_markup=admin_panel_kb())
+    except Exception:
         log.exception("Error in /admin")
-        text = f"Ошибка в /admin: {type(e).__name__}: {e}"
-    await message.answer(text, reply_markup=admin_panel_kb())
+        try:
+            await message.answer("Ошибка в /admin, смотри логи Railway.")
+        except Exception:
+            log.exception("Не удалось даже отправить сообщение об ошибке в /admin")
+
+
+@router.message(Command("export"))
+async def cmd_export(message: Message, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        await _send_users_export(message.chat.id, bot)
+    except Exception:
+        log.exception("Error in /export")
+        await message.answer("Ошибка при выгрузке файла, смотри логи Railway.")
+
+
+@router.callback_query(F.data == "admin_export")
+async def cb_admin_export(callback: CallbackQuery, bot: Bot):
+    if not is_owner(callback.from_user.id):
+        return
+    try:
+        await _send_users_export(callback.message.chat.id, bot)
+    except Exception:
+        log.exception("Error in admin_export callback")
+        await callback.message.answer("Ошибка при выгрузке файла, смотри логи Railway.")
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_recent")

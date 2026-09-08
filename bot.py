@@ -139,8 +139,6 @@ async def send_long_message(bot: Bot, chat_id: int, text: str, reply_markup=None
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     db.get_or_create_user(message.from_user.id, message.from_user.username)
-    if not await require_subscription(message, bot):
-        return
     await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
 
 
@@ -156,9 +154,7 @@ async def cb_recheck_sub(callback: CallbackQuery, bot: Bot, state: FSMContext):
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message, bot: Bot):
-    if not await require_subscription(message, bot):
-        return
+async def cmd_help(message: Message):
     await message.answer(HELP_TEXT)
 
 
@@ -168,17 +164,13 @@ def _balance_text(telegram_id: int, user) -> str:
 
 
 @router.message(Command("balance"))
-async def cmd_balance(message: Message, bot: Bot):
-    if not await require_subscription(message, bot):
-        return
+async def cmd_balance(message: Message):
     user = db.get_or_create_user(message.from_user.id, message.from_user.username)
     await message.answer(_balance_text(message.from_user.id, user), reply_markup=buy_credits_kb())
 
 
 @router.callback_query(F.data == "show_balance")
-async def cb_show_balance(callback: CallbackQuery, bot: Bot):
-    if not await require_subscription(callback, bot):
-        return
+async def cb_show_balance(callback: CallbackQuery):
     user = db.get_or_create_user(callback.from_user.id, callback.from_user.username)
     await callback.message.answer(_balance_text(callback.from_user.id, user), reply_markup=buy_credits_kb())
     await callback.answer()
@@ -207,24 +199,18 @@ async def cb_show_manual(callback: CallbackQuery, bot: Bot):
 
 
 @router.message(Command("support"))
-async def cmd_support(message: Message, bot: Bot):
-    if not await require_subscription(message, bot):
-        return
+async def cmd_support(message: Message):
     await message.answer(SUPPORT_TEXT.format(support_username=SUPPORT_USERNAME))
 
 
 @router.callback_query(F.data == "show_support")
-async def cb_show_support(callback: CallbackQuery, bot: Bot):
-    if not await require_subscription(callback, bot):
-        return
+async def cb_show_support(callback: CallbackQuery):
     await callback.message.answer(SUPPORT_TEXT.format(support_username=SUPPORT_USERNAME))
     await callback.answer()
 
 
 @router.callback_query(F.data == "buy_1")
 async def cb_buy_1(callback: CallbackQuery, bot: Bot):
-    if not await require_subscription(callback, bot):
-        return
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title="1 кредит — Самоосуществлятор целей",

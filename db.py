@@ -17,6 +17,8 @@ Anthropic вернул ошибку, ни кредит, ни попытка не
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import os
 
@@ -35,6 +37,16 @@ def init_db():
                 created_at INTEGER NOT NULL
             )
         """)
+        # Миграция схемы для уже существующих баз (на живом сервере) —
+        # CREATE TABLE IF NOT EXISTS не добавляет новые колонки в старую таблицу.
+        for stmt in (
+            "ALTER TABLE users ADD COLUMN last_free_credit_date TEXT",
+            "ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                c.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # колонка уже существует
         c.execute("""
             CREATE TABLE IF NOT EXISTS requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,46 +108,100 @@ def get_user(telegram_id: int) -> sqlite3.Row | None:
         return c.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
 
 
-def has_available_attempt(telegram_id: int) -> bool:
-    """Может ли пользователь отправить ещё одно сообщение прямо сейчас
-    (либо есть открытый цикл с оставшимися попытками, либо есть кредит на новый цикл)."""
+def _today_kyiv() -> str:
+    """Текущая дата по Киеву (ISO-строка) — используется для дневного сброса
+    бесплатного кредита. Заменяет предыдущий день ровно в полночь по Киеву."""
+    return datetime.now(ZoneInfo("Europe/Kyiv")).date().isoformat()
+
+
+def has_free_credit_today(telegram_id: int) -> bool:
+    """Доступен ли ещё не использованный сегодня бесплатный дневной кредит."""
     user = get_user(telegram_id)
     if user is None:
-        return False
+        return True
+    return user["last_free_credit_date"] != _today_kyiv()
+
+
+def mark_blocked(telegram_id: int) -> None:
+    with _conn() as c:
+        c.execute("UPDATE users SET is_blocked = 1 WHERE telegram_id = ?", (telegram_id,))
+
+
+def mark_unblocked(telegram_id: int) -> None:
+    with _conn() as c:
+        c.execute("UPDATE users SET is_blocked = 0 WHERE telegram_id = ?", (telegram_id,))
+
+
+def has_available_attempt(telegram_id: int) -> bool:
+    """Может ли пользователь отправить ещё одно сообщение прямо сейчас
+    (открытый цикл с оставшимися попытками, ИЛИ бесплатный дневной кредит,
+    ИЛИ купленный кредит на новый цикл)."""
+    user = get_user(telegram_id)
+    if user is None:
+        return True  # ещё не создан — бесплатный дневной кредит точно доступен
     if user["cycle_active"] and user["attempts_used"] < 5:
         return True
-    if not user["cycle_active"] and user["credits_balance"] > 0:
-        return True
+    if not user["cycle_active"]:
+        if user["last_free_credit_date"] != _today_kyiv():
+            return True
+        if user["credits_balance"] > 0:
+            return True
     return False
+
 
 
 def commit_attempt(telegram_id: int, goal_reached: bool) -> dict:
     """Вызывается ПОСЛЕ успешного ответа API — фиксирует списание попытки/кредита.
 
+    Приоритет источников при открытии НОВОГО цикла: сначала бесплатный дневной
+    кредит (если ещё не использован сегодня), затем купленные кредиты.
+
     Возвращает словарь:
     - reason: 'success' | 'continued' | 'exhausted_no_credits' | 'ongoing'
-    - credits_balance: текущий остаток кредитов после операции
+    - credits_balance: текущий остаток КУПЛЕННЫХ кредитов после операции
     - attempts_used: попыток использовано в текущем (возможно новом) цикле
+    - used_free_credit: True, если именно в этом вызове был потрачен дневной бесплатный кредит
 
     'success' — цель прошла рамку, цикл закрыт, остаток попыток сгорает.
-    'continued' — 5 попыток исчерпаны без успеха, но есть ещё кредиты: следующий
-      кредит подключён автоматически, диалог продолжается бесшовно.
-    'exhausted_no_credits' — 5 попыток исчерпаны без успеха и кредитов больше нет.
+    'continued' — 5 попыток исчерпаны без успеха, но есть ещё купленные кредиты:
+      следующий подключён автоматически, диалог продолжается бесшовно.
+      (Бесплатный дневной кредит на 'continued' не расходуется повторно —
+      он всего один в сутки.)
+    'exhausted_no_credits' — 5 попыток исчерпаны без успеха, и купленных
+      кредитов больше нет (дневной уже использован сегодня).
     'ongoing' — попытка использована, цикл продолжается (меньше 5 попыток, не успех).
     """
     with _conn() as c:
         row = c.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
         if row is None:
-            return {"reason": "ongoing", "credits_balance": 0, "attempts_used": 0}
+            return {"reason": "ongoing", "credits_balance": 0, "attempts_used": 0, "used_free_credit": False}
 
         cycle_active = row["cycle_active"]
         attempts_used = row["attempts_used"]
         credits_balance = row["credits_balance"]
+        last_free = row["last_free_credit_date"]
+        today = _today_kyiv()
+        used_free_credit = False
 
         if not cycle_active:
-            credits_balance -= 1
-            cycle_active = 1
-            attempts_used = 1
+            if last_free != today:
+                last_free = today
+                used_free_credit = True
+                cycle_active = 1
+                attempts_used = 1
+            elif credits_balance > 0:
+                credits_balance -= 1
+                cycle_active = 1
+                attempts_used = 1
+            else:
+                # Не должно случаться, если has_available_attempt проверен заранее,
+                # но подстрахуемся от гонки состояний.
+                return {
+                    "reason": "exhausted_no_credits",
+                    "credits_balance": credits_balance,
+                    "attempts_used": 0,
+                    "used_free_credit": False,
+                }
         else:
             attempts_used += 1
 
@@ -157,11 +223,17 @@ def commit_attempt(telegram_id: int, goal_reached: bool) -> dict:
             reason = "ongoing"
 
         c.execute(
-            "UPDATE users SET credits_balance = ?, cycle_active = ?, attempts_used = ? WHERE telegram_id = ?",
-            (credits_balance, cycle_active, attempts_used, telegram_id),
+            "UPDATE users SET credits_balance = ?, cycle_active = ?, attempts_used = ?, "
+            "last_free_credit_date = ? WHERE telegram_id = ?",
+            (credits_balance, cycle_active, attempts_used, last_free, telegram_id),
         )
 
-        return {"reason": reason, "credits_balance": credits_balance, "attempts_used": attempts_used}
+        return {
+            "reason": reason,
+            "credits_balance": credits_balance,
+            "attempts_used": attempts_used,
+            "used_free_credit": used_free_credit,
+        }
 
 
 def log_request(telegram_id: int, mode: str, user_message: str, bot_response: str, charged: bool) -> None:
@@ -233,12 +305,14 @@ def admin_stats() -> dict:
         total_stars = c.execute("SELECT COALESCE(SUM(stars_amount), 0) AS n FROM payments").fetchone()["n"]
         total_requests = c.execute("SELECT COUNT(*) AS n FROM requests").fetchone()["n"]
         active_balance = c.execute("SELECT COALESCE(SUM(credits_balance), 0) AS n FROM users").fetchone()["n"]
+        blocked_count = c.execute("SELECT COUNT(*) AS n FROM users WHERE is_blocked = 1").fetchone()["n"]
         return {
             "total_users": total_users,
             "total_credits_bought": total_credits_bought,
             "total_stars_earned": total_stars,
             "total_requests": total_requests,
             "active_credits_balance": active_balance,
+            "blocked_count": blocked_count,
         }
 
 

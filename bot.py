@@ -14,8 +14,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatAction
+from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -637,10 +636,7 @@ async def _set_commands(bot: Bot):
 
 async def main():
     db.init_db()
-    bot = Bot(
-        token=TELEGRAM_BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
     await _set_commands(bot)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)

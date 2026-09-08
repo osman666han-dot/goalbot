@@ -21,6 +21,11 @@ MANUAL_FILE_PATH = os.getenv("MANUAL_FILE_PATH", "manual.pdf")
 # Стоимость 1 кредита в звёздах Telegram Stars
 CREDIT_PRICE_STARS = int(os.getenv("CREDIT_PRICE_STARS", "100"))
 
+# Юзернейм канала, подписка на который обязательна для использования бота.
+# Бот должен быть добавлен АДМИНИСТРАТОРОМ этого канала, иначе Telegram API
+# не сможет проверять подписку.
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@kolokotol")
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Проверь .env")
 if not ANTHROPIC_API_KEY:

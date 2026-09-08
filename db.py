@@ -331,6 +331,15 @@ def top_users(limit: int = 15) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def all_users_full() -> list[sqlite3.Row]:
+    """Все пользователи со всеми колонками, без ограничения — для CSV-выгрузки."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT telegram_id, username, credits_balance, cycle_active, attempts_used, "
+            "last_free_credit_date, is_blocked, created_at FROM users ORDER BY telegram_id"
+        ).fetchall()
+
+
 def user_history(telegram_id: int, limit: int = 20) -> list[sqlite3.Row]:
     with _conn() as c:
         return c.execute(
